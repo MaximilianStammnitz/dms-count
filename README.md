@@ -1,19 +1,89 @@
-# dms_count: the variant counter in C
+# dms-count
 
-`dms_count.c` is a one-pass, single-file C/htslib implementation of `modules/local/variantcounting/templates/count_variants.py` (dev @ eb0d3ce). Same command line as the benchmark CLI of the Python script, same `variant_counts.tsv`, byte for byte (checked on the four test libraries at `--min_flank 2` and `0`, on the 1.14 M-read scaled BAM at 1 and 2 threads, and on the end-to-end-aligned BAMs with their additional multi-base variants):
+`dms_count` counts the variants in aligned reads from deep mutational scanning (DMS) experiments. It reads a BAM or SAM file of reads aligned to a single open reading frame (ORF) and writes one table row per distinct variant. Each row holds the variant's read count, its mean coverage, and its annotation at nucleotide, codon and amino-acid level.
 
-| counter | CPU s (1.14 M reads, 1 thread) | wall s | peak RSS |
-| --- | --- | --- | --- |
-| dev (v1.0.0 template) | 39.9 | 37.4 | 155 MB |
-| Python, patched (this folder's patch) | 9.1 | 8.1 | 158 MB |
-| **dms_count** | **0.7** | **0.7** | **14 MB** |
+It is a single C file on top of [HTSlib](https://www.htslib.org/). It is the variant counter of the nf-core pipeline [nf-core/deepmutscan](https://nf-co.re/deepmutscan) from v1.1.0 on, and its output is byte-identical to the pipeline's earlier Python counter.
 
-What it does in that one pass: coverage per ORF position with the template's two semantics (flank + quality filter over all aligned bases for `--min_flank > 0`; pysam `count_coverage` semantics, A/C/G/T only and QC-fail/duplicate reads skipped, for `--min_flank 0`), mismatch extraction from CIGAR + MD exactly as `parse_read`, the GATK-style variant strings, codon/amino-acid annotation with Biopython's rules for ambiguous codons, aggregation, the per-variant coverage mean computed at the end from the complete track, and the template's sort order. It also writes `<out>.columns.tsv` and `<out>.versions.yml`.
+| counter (1.14 M reads, one thread) | CPU time | peak memory |
+| --- | --- | --- |
+| deepmutscan v1.0.0 (Python, pysam) | 39.9 s | 155 MB |
+| `dms_count` | 0.7 s | 14 MB |
 
-Build: `make -f build.mk HTSLIB=/path/to/htslib-1.21` (a built source tree) or `make -f build.mk HTSLIB_PREFIX=$CONDA_PREFIX` (an installed htslib). `dms_count --version` prints the tool and htslib versions; `--columns FILE` sets where the column sheet goes (default `variant_counts_columns.tsv`, as the module expects). Also here: `LICENSE` (MIT), `Dockerfile` (local test image), `bioconda/dms-count/` (recipe) and `pipeline_module/` (the replacement module files); the step-by-step is in `../../README_implementation_steps.md`.
+## Installation
 
-## How it could reach the pipeline
+From Bioconda:
 
-nf-core modules install their tools from Bioconda/Biocontainers, so the binary needs a package: a small Bioconda recipe (`deepmutscan-count`, or a broader `deepmutscan-tools` package that could later also hold the error-correction code), built from a tagged release of this file with `htslib` as its only dependency. The replacement module (`pipeline_module/modules/local/variantcounting/`) is already commit 5 of `patch_performance_boost/`: `dms_count` with the same inputs and outputs as the Python module, label `process_single`; what it still needs is the package, so that `nf-core pipelines lint --fix container_configs` can pin its container. The patched Python template (commit 1) is the output-neutral stepping stone kept in the history. Step-by-step in `../../README_implementation_steps.md`.
+```bash
+conda install -c bioconda -c conda-forge dms-count
+```
 
-The same file is also the natural home for the alignment-free / ungapped counting idea of the plan's §2.3 level 3 and for the v2.0.0 variant model (multi-codon variants, indels): both are easier to add here than to the Python template.
+From source, with HTSlib 1.17 or later installed:
+
+```bash
+make -f build.mk HTSLIB_PREFIX=/usr/local     # prefix of an installed HTSlib (include/, lib/)
+make -f build.mk HTSLIB=/path/to/htslib       # or a built HTSlib source tree (libhts.a)
+bash test/run_test.sh                          # checks the build against the bundled test data
+```
+
+## Usage
+
+```bash
+dms_count --bam aligned.bam --fasta orf.fasta --reading_frame 352-1383 \
+          --id sample1 --out sample1.variant_counts.tsv
+```
+
+| option | default | meaning |
+| --- | --- | --- |
+| `--bam FILE` | required | BAM or SAM; `-` reads from standard input. Need not be sorted or indexed. |
+| `--fasta FILE` | required | the reference, with exactly one sequence |
+| `--reading_frame A-B` | required | first and last base of the ORF in the reference (1-based, inclusive) |
+| `--id NAME` | `sample` | sample name, used in error messages |
+| `--out FILE` | required | the variant table |
+| `--base_qual Q` | 40 | minimum base quality, for variant bases and for coverage |
+| `--min_flank N` | 2 | ignore variants and coverage in the first and last N bases of each read; with 0, coverage counts A/C/G/T bases only and skips QC-fail and duplicate reads |
+| `--skip_indel_reads` | off | ignore reads whose alignment has an insertion, deletion or skip |
+| `--threads N` | 1 | HTSlib threads for decompressing the input |
+| `--columns FILE` | `variant_counts_columns.tsv` | where to write the column descriptions |
+| `--version` | | print the version of `dms_count` and HTSlib |
+
+Notes on the input:
+
+- Variants are read from the `MD` tag, as written by BWA and bwa-mem3. Reads without it are counted for coverage but not for variants; `samtools calmd` adds it.
+- Unmapped reads are skipped, and secondary and supplementary alignments add no variants. There is no mapping-quality filter; filter beforehand if you need one (e.g., `samtools view -q 30`).
+- Streaming works, e.g. `aligner ... | samtools view -u - | dms_count --bam - ...`.
+
+## Output
+
+A tab-separated table without header, one row per distinct combination of nucleotide changes in a read, sorted by the first changed position. `dms_count` prints the column descriptions to `--columns`:
+
+| column | content |
+| --- | --- |
+| `counts` | reads carrying this variant |
+| `cov` | mean coverage over the variant's changed bases |
+| `mean_length_variant_reads` | placeholder, always 0 |
+| `varying_bases` | number of changed bases |
+| `base_mut` | changes as `position:ref>alt` (reference position, 1-based), e.g. `352:G>A` |
+| `varying_codons` | number of changed codons |
+| `codon_mut` | codon changes as `codon:ref>alt` (codon 1 = first codon of the reading frame), e.g. `1:GCT>ACT` |
+| `aa_mut` | amino-acid change per codon with type: `S` synonymous, `M` missense, `N` nonsense; stop = `X`, e.g. `M:A>T` |
+| `pos_mut` | compact amino-acid changes, e.g. `A1T;A2H` |
+
+Codons are translated with the standard genetic code. Ambiguous bases give the amino acid all their codons agree on, otherwise `X`. A summary line goes to standard error:
+
+```
+dms_count: 4587 reads, 378 variant-carrying reads, 364 distinct variants
+```
+
+## Test data
+
+`test/` holds 4,587 reads of the GID1A amplicon from the nf-core/deepmutscan test data, aligned with bwa-mem3, the reference, and the expected outputs. `bash test/run_test.sh [path/to/dms_count]` runs `dms_count` from the file and from standard input and compares both with the expected table.
+
+## Citation
+
+If you use `dms_count`, please cite nf-core/deepmutscan (https://nf-co.re/deepmutscan) and HTSlib:
+
+> Bonfield JK, Marshall J, Danecek P, Li H, Ohan V, Whitwham A, Keane T, Davies RM. HTSlib: C library for reading/writing high-throughput sequencing data. *GigaScience* 10, giab007 (2021). https://doi.org/10.1093/gigascience/giab007
+
+## License
+
+MIT, see [LICENSE](LICENSE).

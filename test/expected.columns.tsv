@@ -1,0 +1,10 @@
+column	description
+counts	Number of reads supporting this variant (observations)
+cov	Mean sequencing coverage across the variant's mutated base positions
+mean_length_variant_reads	Placeholder (0); mean read length of supporting reads is not computed
+varying_bases	Number of nucleotide substitutions in the variant
+base_mut	Nucleotide change(s), 1-based reference position(s), e.g. 352:G>A
+varying_codons	Number of codons altered by the variant
+codon_mut	Codon change(s), 1-based codon index, e.g. 1:GCT>ACT
+aa_mut	Amino-acid change per codon; type S=synonymous, M=missense, N=nonsense; stop=X, e.g. M:A>T
+pos_mut	Compact per-codon amino-acid change, e.g. A1T (stop written as X)
