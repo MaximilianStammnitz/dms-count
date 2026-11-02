@@ -1,0 +1,13 @@
+name: test
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install htslib
+        run: sudo apt-get update && sudo apt-get install -y libhts-dev
+      - name: Build
+        run: make -f build.mk HTSLIB_PREFIX=/usr
+      - name: Test
+        run: bash test/run_test.sh
