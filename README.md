@@ -1,5 +1,13 @@
 # dms-count
 
+```
+  >>>>>>>>>>>>>>>>>>>>>
+  >>>>>>X>>>>>>>>>>>>>>          \(o_o)/       S77R   |||
+  >>>>>>>>>>>>>X>>>>>>>    ==> dms_count ==>   A298X  ||
+  >>>>X>>>>>>>>>>>>>>>>                        E335K  ||
+  >>>>>>>>>>>>>>>>>>>>>
+```
+
 `dms_count` counts the variants in aligned reads from deep mutational scanning (DMS) experiments. It reads a BAM or SAM file of reads aligned to a single open reading frame (ORF) and writes one table row per distinct variant. Each row holds the variant's read count, its mean coverage, and its annotation at nucleotide, codon and amino-acid level.
 
 It is a single C file on top of [HTSlib](https://www.htslib.org/). It is the variant counter of the nf-core pipeline [nf-core/deepmutscan](https://nf-co.re/deepmutscan) from v1.1.0 on, and its output is byte-identical to the pipeline's earlier Python counter.
@@ -22,7 +30,7 @@ From source, with HTSlib 1.17 or later installed:
 ```bash
 make -f build.mk HTSLIB_PREFIX=/usr/local     # prefix of an installed HTSlib (include/, lib/)
 make -f build.mk HTSLIB=/path/to/htslib       # or a built HTSlib source tree (libhts.a)
-bash test/run_test.sh                          # checks the build against the bundled test data
+bash test/run_test.sh                         # checks the build against the bundled test data
 ```
 
 ## Usage
@@ -80,9 +88,9 @@ dms_count: 4587 reads, 378 variant-carrying reads, 364 distinct variants
 
 ## Citation
 
-If you use `dms_count`, please cite nf-core/deepmutscan (https://nf-co.re/deepmutscan) and HTSlib:
+If you use `dms_count`, please cite nf-core/deepmutscan:
 
-> Bonfield JK, Marshall J, Danecek P, Li H, Ohan V, Whitwham A, Keane T, Davies RM. HTSlib: C library for reading/writing high-throughput sequencing data. *GigaScience* 10, giab007 (2021). https://doi.org/10.1093/gigascience/giab007
+> Wehnert B, et al. bioRxiv preprint (in preparation). https://nf-co.re/deepmutscan
 
 ## License
 
