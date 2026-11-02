@@ -1,5 +1,7 @@
 # dms-count
 
+`dms_count` counts the variants in aligned reads from deep mutational scanning (DMS) experiments. It reads a BAM or SAM file of reads aligned to a single open reading frame (ORF) and writes one table row per distinct variant. Each row holds the variant's read count, its mean coverage, and its annotation at nucleotide, codon and amino-acid level.
+
 ```
   >>>>>>>>>>>>>>>>>>>>>
   >>>>>>X>>>>>>>>>>>>>>          \(o_o)/       S77R   |||
@@ -7,8 +9,6 @@
   >>>>X>>>>>>>>>>>>>>>>                        E335K  ||
   >>>>>>>>>>>>>>>>>>>>>
 ```
-
-`dms_count` counts the variants in aligned reads from deep mutational scanning (DMS) experiments. It reads a BAM or SAM file of reads aligned to a single open reading frame (ORF) and writes one table row per distinct variant. Each row holds the variant's read count, its mean coverage, and its annotation at nucleotide, codon and amino-acid level.
 
 It is a single C file on top of [HTSlib](https://www.htslib.org/). It is the variant counter of the nf-core pipeline [nf-core/deepmutscan](https://nf-co.re/deepmutscan) from v1.1.0 on, and its output is byte-identical to the pipeline's earlier Python counter.
 
