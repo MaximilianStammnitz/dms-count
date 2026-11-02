@@ -1,4 +1,4 @@
-# dms-count
+# dms_count
 
 `dms_count` counts the variants in aligned reads from deep mutational scanning (DMS) experiments. It reads a BAM or SAM file of reads aligned to a single open reading frame (ORF) and writes one table row per distinct variant. Each row holds the variant's read count, its mean coverage, and its annotation at nucleotide, codon and amino-acid level.
 
