@@ -1,6 +1,6 @@
 column	description
 counts	Number of reads supporting this variant (observations)
-cov	Mean sequencing coverage across the variant's mutated base positions
+cov	Joint sequencing coverage: reads whose usable interval (min_flank-trimmed, ORF-clipped) spans ALL of the variant's mutated positions, capped by the smallest per-position base-quality-filtered coverage. Falls with the distance between mutated positions, as GATK AnalyzeSaturationMutagenesis does.
 mean_length_variant_reads	Placeholder (0); mean read length of supporting reads is not computed
 varying_bases	Number of nucleotide substitutions in the variant
 base_mut	Nucleotide change(s), 1-based reference position(s), e.g. 352:G>A

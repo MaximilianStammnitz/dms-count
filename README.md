@@ -1,6 +1,6 @@
 # dms_count
 
-`dms_count` counts the variants in aligned reads from deep mutational scanning (DMS) experiments. It reads a BAM or SAM file of reads aligned to a single open reading frame (ORF) and writes one table row per distinct variant. Each row holds the variant's read count, its mean coverage, and its annotation at nucleotide, codon and amino-acid level.
+`dms_count` counts the variants in aligned reads from deep mutational scanning (DMS) experiments. It reads a BAM or SAM file of reads aligned to a single open reading frame (ORF) and writes one table row per distinct variant. Each row holds the variant's read count, its coverage, and its annotation at nucleotide, codon and amino-acid level.
 
 ```
   >>>>>>>>>>>>>>>>>>>>>
@@ -10,7 +10,7 @@
   >>>>>>>>>>>>>>>>>>>>>
 ```
 
-It is a single C file on top of [HTSlib](https://www.htslib.org/). It is the variant counter of the nf-core pipeline [nf-core/deepmutscan](https://nf-co.re/deepmutscan) from v1.1.0 on, and its output is byte-identical to the pipeline's earlier Python counter.
+It is a single C file on top of [HTSlib](https://www.htslib.org/). It is the variant counter of the nf-core pipeline [nf-core/deepmutscan](https://nf-co.re/deepmutscan) from v1.1.0 on.
 
 | counter (1.14 M reads, one thread) | CPU time | peak memory |
 | --- | --- | --- |
@@ -67,7 +67,7 @@ A tab-separated table without header, one row per distinct combination of nucleo
 | column | content |
 | --- | --- |
 | `counts` | reads carrying this variant |
-| `cov` | mean coverage over the variant's changed bases |
+| `cov` | the variant's joint coverage: the reads that cover all its changed bases at once (see Coverage) |
 | `mean_length_variant_reads` | placeholder, always 0 |
 | `varying_bases` | number of changed bases |
 | `base_mut` | changes as `position:ref>alt` (reference position, 1-based), e.g. `352:G>A` |
@@ -75,6 +75,14 @@ A tab-separated table without header, one row per distinct combination of nucleo
 | `codon_mut` | codon changes as `codon:ref>alt` (codon 1 = first codon of the reading frame), e.g. `1:GCT>ACT` |
 | `aa_mut` | amino-acid change per codon with type: `S` synonymous, `M` missense, `N` nonsense; stop = `X`, e.g. `M:A>T` |
 | `pos_mut` | compact amino-acid changes, e.g. `A1T;A2H` |
+
+### Coverage
+
+A read can show a variant with several changed bases only if it covers all of them, so `cov` counts the reads whose usable interval spans the variant from its first to its last changed base. The usable interval is the aligned part of the read without its soft-clipped ends and without `--min_flank` bases at either end, clipped to the reading frame. This count is capped by the smallest per-base coverage of the changed bases (which carries the `--base_qual` filter) and is never below the variant's own count.
+
+For a variant with one changed base this is the per-base coverage, as before. For changes further apart it falls with their distance, as in GATK AnalyzeSaturationMutagenesis, because fewer reads span both. In nf-core/deepmutscan's false-double error model, the coverage of double mutants sets how many chances a read had to show an error next to a designed variant, so it has to be the joint coverage.
+
+0.1.0 reported the mean of the per-base coverages over the changed bases instead, which stays at about the per-base coverage however far apart the changes are. That was a bug, fixed in 0.2.0.
 
 Codons are translated with the standard genetic code. Ambiguous bases give the amino acid all their codons agree on, otherwise `X`. A summary line goes to standard error:
 

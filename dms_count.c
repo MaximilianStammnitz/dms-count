@@ -8,11 +8,18 @@
  *     min_flank query positions; with --min_flank 0 pysam's count_coverage semantics: A/C/G/T only,
  *     quality >= base_qual, reads flagged unmapped/secondary/QC-fail/duplicate skipped),
  *   - one row per distinct nucleotide-variant combination (GATK AnalyzeSaturationMutagenesis notation),
- *     counts, mean coverage over the changed bases, codon/amino-acid annotation, sorted by leading
- *     reference position then by the variant string.
- * Everything happens in one pass over the BAM; the per-variant coverage average is computed at the end
- * from the complete coverage track, which is what the template does too (its workers see the finished
- * coverage dict).
+ *     counts, coverage, codon/amino-acid annotation, sorted by leading reference position then by the
+ *     variant string.
+ *   - the coverage of a variant is its joint coverage, the reads that could have shown the whole variant.
+ *     A read supports a variant with several changed bases only if it covers all of them, so the coverage
+ *     is the number of reads whose usable interval (aligned block minus --min_flank bases at either read
+ *     end, clipped to the ORF) spans the variant from its first to its last changed base, capped by the
+ *     smallest per-base coverage (which carries the --base_qual and --min_flank filters) and never below
+ *     the variant's own count. For a single changed base this is the per-base coverage; for changes
+ *     further apart it falls with their distance, as GATK AnalyzeSaturationMutagenesis does. (0.1.0 took
+ *     the mean per-base coverage over the changed bases, which does not fall with distance: a bug.)
+ * Everything happens in one pass over the BAM; the per-variant coverage is computed at the end from the
+ * complete coverage track and the read intervals.
  *
  * build: gcc -O2 -o dms_count dms_count.c -I<htslib> <htslib>/libhts.a -lz -lbz2 -llzma -lpthread -lm
  * usage: dms_count --bam in.bam --fasta ref.fa --reading_frame 352-1383 [--base_qual 40] [--min_flank 2] [--skip_indel_reads]
@@ -31,7 +38,7 @@
 #include "htslib/hts.h"
 #include "htslib/thread_pool.h"
 
-#define DMS_COUNT_VERSION "0.1.0"
+#define DMS_COUNT_VERSION "0.2.0"
 #define die(...) do { fprintf(stderr, "ERROR: " __VA_ARGS__); fprintf(stderr, "\n"); exit(1); } while (0)
 
 /* ---------- genetic code (standard table 1), with Biopython's handling of IUPAC-ambiguous codons:
@@ -63,7 +70,7 @@ static char translate(const char *codon) {
 typedef struct {
     char *base_mut, *codon_mut, *aa_mut, *pos_mut;
     int64_t counts; int varying_bases, varying_codons;
-    int *pos; int npos;            /* 0-based reference positions of the changed bases (for the coverage mean) */
+    int *pos; int npos;            /* 0-based reference positions of the changed bases (for the coverage) */
     int sort_pos;
 } row_t;
 typedef struct { row_t *rows; size_t n, cap; int64_t *slots; size_t nslots; } table_t;
@@ -103,6 +110,32 @@ static char *read_fasta(const char *path, char **name_out) {
     *name_out = name; return seq.s ? seq.s : strdup("");
 }
 
+/* ---------- read intervals for the joint coverage: counts per (start, end) pair ----------
+ * Each read contributes its usable ORF interval [s, e) (ORF-relative, end exclusive). Only the number of
+ * reads per distinct (s, e) is kept, so memory is bounded by the distinct intervals, not by the reads. */
+typedef struct { uint64_t *keys; int64_t *vals; size_t n, cap; } pairmap_t;   /* key = s * (L + 1) + e, stored + 1 (0 = empty) */
+static void pm_init(pairmap_t *m) { m->n = 0; m->cap = 1 << 16; m->keys = calloc(m->cap, sizeof(uint64_t)); m->vals = calloc(m->cap, sizeof(int64_t)); }
+static void pm_add(pairmap_t *m, uint64_t key, int64_t v);
+static void pm_grow(pairmap_t *m) {
+    pairmap_t g = { calloc(m->cap * 2, sizeof(uint64_t)), calloc(m->cap * 2, sizeof(int64_t)), 0, m->cap * 2 };
+    for (size_t i = 0; i < m->cap; i++) if (m->keys[i]) pm_add(&g, m->keys[i] - 1, m->vals[i]);
+    free(m->keys); free(m->vals); *m = g;
+}
+static void pm_add(pairmap_t *m, uint64_t key, int64_t v) {
+    if ((m->n + 1) * 2 > m->cap) pm_grow(m);
+    uint64_t h = (key * 0x9E3779B97F4A7C15ULL) & (m->cap - 1);
+    while (m->keys[h] && m->keys[h] != key + 1) h = (h + 1) & (m->cap - 1);
+    if (!m->keys[h]) { m->keys[h] = key + 1; m->n++; }
+    m->vals[h] += v;
+}
+typedef struct { uint64_t key; int64_t n; } pair_t;
+static int cmp_pair(const void *a, const void *b) { uint64_t x = ((const pair_t *)a)->key, y = ((const pair_t *)b)->key; return x < y ? -1 : x > y; }
+/* Fenwick tree over interval ends 0..L, for "reads with s <= a and e > b" */
+static void fw_add(int64_t *t, int n, int i, int64_t v) { for (i++; i <= n; i += i & -i) t[i] += v; }
+static int64_t fw_sum(const int64_t *t, int i) { int64_t s = 0; for (i++; i > 0; i -= i & -i) s += t[i]; return s; }   /* sum over 0..i */
+typedef struct { int a, b; size_t row; } query_t;
+static int cmp_query(const void *x, const void *y) { const query_t *p = x, *q = y; return p->a != q->a ? (p->a < q->a ? -1 : 1) : (p->row < q->row ? -1 : p->row > q->row); }
+
 static int cmp_rows(const void *a, const void *b) {
     const row_t *x = a, *y = b; if (x->sort_pos != y->sort_pos) return x->sort_pos < y->sort_pos ? -1 : 1; return strcmp(x->base_mut, y->base_mut);
 }
@@ -133,7 +166,9 @@ int main(int argc, char **argv) {
     int n_full = 0; for (int i = 0; i < region_len - 2; i += 3) if (i + 3 <= region_len) n_full++;
 
     /* columns sheet, as the template writes it */
-    { FILE *c = fopen(columns, "w"); if (c) { fputs("column\tdescription\ncounts\tNumber of reads supporting this variant (observations)\ncov\tMean sequencing coverage across the variant's mutated base positions\nmean_length_variant_reads\tPlaceholder (0); mean read length of supporting reads is not computed\nvarying_bases\tNumber of nucleotide substitutions in the variant\nbase_mut\tNucleotide change(s), 1-based reference position(s), e.g. 352:G>A\nvarying_codons\tNumber of codons altered by the variant\ncodon_mut\tCodon change(s), 1-based codon index, e.g. 1:GCT>ACT\naa_mut\tAmino-acid change per codon; type S=synonymous, M=missense, N=nonsense; stop=X, e.g. M:A>T\npos_mut\tCompact per-codon amino-acid change, e.g. A1T (stop written as X)\n", c); fclose(c); } }
+    { FILE *c = fopen(columns, "w"); if (c) { fputs("column\tdescription\ncounts\tNumber of reads supporting this variant (observations)\n", c);
+      fputs("cov\tJoint sequencing coverage: reads whose usable interval (min_flank-trimmed, ORF-clipped) spans ALL of the variant's mutated positions, capped by the smallest per-position base-quality-filtered coverage. Falls with the distance between mutated positions, as GATK AnalyzeSaturationMutagenesis does.\n", c);
+      fputs("mean_length_variant_reads\tPlaceholder (0); mean read length of supporting reads is not computed\nvarying_bases\tNumber of nucleotide substitutions in the variant\nbase_mut\tNucleotide change(s), 1-based reference position(s), e.g. 352:G>A\nvarying_codons\tNumber of codons altered by the variant\ncodon_mut\tCodon change(s), 1-based codon index, e.g. 1:GCT>ACT\naa_mut\tAmino-acid change per codon; type S=synonymous, M=missense, N=nonsense; stop=X, e.g. M:A>T\npos_mut\tCompact per-codon amino-acid change, e.g. A1T (stop written as X)\n", c); fclose(c); } }
 
     samFile *fp = sam_open(bam_path, "r"); if (!fp) die("cannot open %s", bam_path);
     htsThreadPool pool = {NULL, 0}; if (threads > 1) { pool.pool = hts_tpool_init(threads); hts_set_opt(fp, HTS_OPT_THREAD_POOL, &pool); }
@@ -141,6 +176,7 @@ int main(int argc, char **argv) {
     int tid_ref = sam_hdr_name2tid(hdr, ref_name);
 
     int64_t *cov = calloc(region_len, sizeof(int64_t));
+    pairmap_t spans; pm_init(&spans);
     table_t table; table_init(&table);
     bam1_t *b = bam_init1();
     var_t *vars = NULL; int nvars_cap = 0;
@@ -161,6 +197,24 @@ int main(int argc, char **argv) {
             int has = 0;
             for (int k = 0; k < ncig; k++) { int op = bam_cigar_op(cigar[k]); if (op == BAM_CINS || op == BAM_CDEL || op == BAM_CREF_SKIP) { has = 1; break; } }
             if (has) continue;
+        }
+
+        /* ---- usable interval of the read, for the joint coverage: its aligned block (soft clips removed)
+           minus min_flank bases at either read end, as reference positions, clipped to the ORF. With no
+           indels in the block (the pipeline removes such reads) query and reference advance together;
+           the end is capped at the aligned end in case one slips through. Every mapped read counts, as
+           for the per-base coverage with --min_flank > 0. ---- */
+        if (qlen > 0 && ncig > 0) {
+            int qa_start = 0, qa_end = qlen;
+            for (int k = 0; k < ncig; k++) { int op = bam_cigar_op(cigar[k]); if (op == BAM_CSOFT_CLIP) qa_start += bam_cigar_oplen(cigar[k]); else if (op != BAM_CHARD_CLIP) break; }
+            for (int k = ncig - 1; k >= 0; k--) { int op = bam_cigar_op(cigar[k]); if (op == BAM_CSOFT_CLIP) qa_end -= bam_cigar_oplen(cigar[k]); else if (op != BAM_CHARD_CLIP) break; }
+            int q_lo = min_flank > qa_start ? min_flank : qa_start, q_hi = qlen - min_flank < qa_end ? qlen - min_flank : qa_end;
+            if (q_hi > q_lo) {
+                int64_t ref_lo = (int64_t)rs + (q_lo - qa_start), ref_hi = (int64_t)rs + (q_hi - qa_start);
+                int64_t ref_end = bam_endpos(b); if (ref_hi > ref_end) ref_hi = ref_end;
+                if (ref_lo < orf_start) ref_lo = orf_start; if (ref_hi > orf_end + 1) ref_hi = orf_end + 1;
+                if (ref_hi > ref_lo) pm_add(&spans, (uint64_t)(ref_lo - orf_start) * (uint64_t)(region_len + 1) + (uint64_t)(ref_hi - orf_start), 1);
+            }
         }
 
         /* ---- coverage ---- */
@@ -267,11 +321,42 @@ int main(int argc, char **argv) {
       if (tot == 0) { fprintf(stderr, "ERROR: no reads pass the quality filters inside the reading frame %s of %s for sample %s.\n  Check that --reading_frame lies inside the reference, that the reads really come from this amplicon, and that --base_qual (currently %d) is not above the instrument quality of the data.\n", rf, ref_name, id, base_qual); return 1; } }
 
     qsort(table.rows, table.n, sizeof(row_t), cmp_rows);
+
+    /* joint coverage: for every variant, the reads whose interval [s, e) has s <= first changed base and
+       e > last changed base. One sweep over the variants in order of their first base, adding the
+       intervals that start at or before it to a Fenwick tree over interval ends. */
+    int64_t *span_cov = NULL;
+    if (table.n > 0) {
+        span_cov = calloc(table.n, sizeof(int64_t));
+        pair_t *pk = malloc((spans.n ? spans.n : 1) * sizeof(pair_t)); size_t np = 0;
+        for (size_t i = 0; i < spans.cap; i++) if (spans.keys[i]) { pk[np].key = spans.keys[i] - 1; pk[np].n = spans.vals[i]; np++; }
+        qsort(pk, np, sizeof(pair_t), cmp_pair);
+        query_t *q = malloc(table.n * sizeof(query_t));
+        for (size_t i = 0; i < table.n; i++) {
+            row_t *r = &table.rows[i]; int lo = r->pos[0], hi = r->pos[0];
+            for (int j = 1; j < r->npos; j++) { if (r->pos[j] < lo) lo = r->pos[j]; if (r->pos[j] > hi) hi = r->pos[j]; }
+            q[i].a = lo - orf_start; q[i].b = hi - orf_start; q[i].row = i;
+        }
+        qsort(q, table.n, sizeof(query_t), cmp_query);
+        int64_t *fw = calloc(region_len + 2, sizeof(int64_t)); int64_t added = 0; size_t pi = 0;
+        for (size_t k = 0; k < table.n; k++) {
+            while (pi < np && (int64_t)(pk[pi].key / (uint64_t)(region_len + 1)) <= q[k].a) {
+                fw_add(fw, region_len + 1, (int)(pk[pi].key % (uint64_t)(region_len + 1)), pk[pi].n); added += pk[pi].n; pi++;
+            }
+            span_cov[q[k].row] = added - fw_sum(fw, q[k].b);      /* intervals ending after the last changed base */
+        }
+        free(fw); free(q); free(pk);
+    }
+    free(spans.keys); free(spans.vals);
+
     FILE *o = fopen(out, "w"); if (!o) die("cannot write %s", out);
     for (size_t i = 0; i < table.n; i++) {
-        row_t *r = &table.rows[i]; int64_t s = 0; for (int j = 0; j < r->npos; j++) s += cov[r->pos[j] - orf_start];
-        int64_t cov_avg = r->npos ? (int64_t)((double)s / r->npos) : 0;       /* int(mean(...)): truncation of the float mean */
-        fprintf(o, "%lld\t%lld\t0\t%d\t%s\t%d\t%s\t%s\t%s\n", (long long)r->counts, (long long)cov_avg, r->varying_bases, r->base_mut, r->varying_codons, r->codon_mut, r->aa_mut, r->pos_mut);
+        row_t *r = &table.rows[i];
+        int64_t c = r->npos ? cov[r->pos[0] - orf_start] : 0;
+        for (int j = 1; j < r->npos; j++) if (cov[r->pos[j] - orf_start] < c) c = cov[r->pos[j] - orf_start];
+        if (span_cov[i] < c) c = span_cov[i];                  /* capped by the smallest per-base coverage */
+        if (c < r->counts) c = r->counts;                      /* never below the reads that carry the variant */
+        fprintf(o, "%lld\t%lld\t0\t%d\t%s\t%d\t%s\t%s\t%s\n", (long long)r->counts, (long long)c, r->varying_bases, r->base_mut, r->varying_codons, r->codon_mut, r->aa_mut, r->pos_mut);
     }
     fclose(o);
     fprintf(stderr, "dms_count: %lld reads, %lld variant-carrying reads, %zu distinct variants\n", (long long)n_reads, (long long)n_variant_reads, table.n);
